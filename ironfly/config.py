@@ -29,6 +29,11 @@ class DTEProfile:
     min_credit_to_width_condor: float = 0.25
     min_credit_to_width_fly: float = 0.40
     fly_recenter_frac: float = 0.50     # |spot-body| / wing as a fraction that triggers recentre
+    # holding-period rules, all relative to the structure's own decay curve (see structure.decay_curve)
+    early_take_frac: float = 0.75       # take profit if >= this fraction of target is captured ...
+    early_time_frac: float = 0.40       # ... within this fraction of expected_days_to_target
+    stale_mult: float = 1.5             # exit if held longer than stale_mult x expected_days_to_target without hitting target
+    lag_tolerance: float = 0.5          # flag LAGGING when actual pnl < lag_tolerance x expected pnl after half the planned hold
 
 
 PROFILES: dict[str, DTEProfile] = {

@@ -30,6 +30,8 @@ def test_calm_regime_builds_structure():
     s = r.structure
     assert s.credit > 0 and s.max_loss > 0 and s.be_lo < eng.snapshot().spot < s.be_hi and 0 < s.pop < 1
     assert abs(s.delta) < 0.15
+    assert s.half_life_days and s.days_to_target and 0 < s.days_to_target <= s.half_life_days < s.dte
+    assert s.planned_hold_days == round(s.dte - PROFILES["weekly"].exit_dte, 3)
 
 
 def test_stress_regime_vetoes():
@@ -50,7 +52,7 @@ def test_management_triggers():
     reg = classify(snap, cfg, prof, [])
     expiry = [e for e in snap.expiries() if round(snap.dte(e)) == 7][0]
     s = build_condor(snap, expiry, cfg, prof)
-    pos = Position.from_structure("t", s, 1, ts, "weekly")
+    pos = Position.from_structure("t", s, 1, ts, "weekly", snap.spot)
     # same snapshot -> HOLD
     assert evaluate(pos, snap, reg, cfg, prof, [])[0].type == "HOLD"
     # pretend we sold it for much more -> profit target
@@ -68,6 +70,33 @@ def test_management_triggers():
     assert evaluate(pos, late, reg, cfg, prof, [])[0].type == "TAKE_PROFIT"   # theta did its job first
     flat = Position(**{**pos.to_dict(), "entry_credit": s.credit * 0.10})       # too little credit to hit 50%
     assert evaluate(flat, late, reg, cfg, prof, [])[0].type == "TIME_EXIT"
+
+
+def test_schedule_rules():
+    from dataclasses import replace
+    from ironfly.structure import reprice
+    cfg, prof = Config(), PROFILES["monthly"]
+    ts = datetime(2026, 9, 21, 10, 15, tzinfo=ET)
+    snap = SyntheticFeed(regime="calm", ts=ts).snapshot()
+    reg = classify(snap, cfg, prof, [])
+    expiry = [e for e in snap.expiries() if round(snap.dte(e)) == 45][0]
+    s = build_condor(snap, expiry, cfg, prof)
+    pos = Position.from_structure("m", s, 1, ts, "monthly", snap.spot)
+    # 15 days later, spot unchanged: pnl should sit on the theta schedule
+    later = SyntheticFeed(regime="calm", ts=ts + timedelta(days=15)).snapshot()
+    a = evaluate(pos, later, reg, cfg, prof, [])[0]
+    assert abs(a.details["vs_schedule"]) < 0.08, a.details
+    # same clock, but pretend we entered for barely more than today's close cost -> stale
+    cost, _ = reprice(pos.legs, later, expiry, cfg)
+    stale = Position(**{**pos.to_dict(), "entry_credit": cost * 1.05})
+    a = evaluate(stale, later, reg, cfg, replace(prof, stale_mult=0.5), [])[0]
+    assert a.type == "STALE_EXIT", a
+    # captured 45% in 2 days -> ahead of schedule
+    soon = SyntheticFeed(regime="calm", ts=ts + timedelta(days=2), dtes=(43,)).snapshot()
+    cost, _ = reprice(pos.legs, soon, expiry, cfg)
+    early = Position(**{**pos.to_dict(), "entry_credit": cost / 0.55})
+    a = evaluate(early, soon, reg, cfg, prof, [])[0]
+    assert a.type == "TAKE_PROFIT" and "ahead of schedule" in a.reason, a
 
 
 if __name__ == "__main__":

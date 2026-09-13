@@ -44,6 +44,10 @@ class Structure:
     vega: float
     credit_to_width: float
     notes: list[str] = field(default_factory=list)
+    gross_credit: float = 0.0         # mid credit before slippage (decay curve baseline)
+    half_life_days: float | None = None        # days until premium is expected to halve (spot, IV frozen)
+    days_to_target: float | None = None        # days until the profile's profit target is expected
+    planned_hold_days: float | None = None     # entry -> mechanical time exit
 
     @property
     def short_put(self) -> Leg:
@@ -84,7 +88,42 @@ def assemble(kind: str, snap: Snapshot, expiry: date, sp: OptionQuote, lp: Optio
     return Structure(kind, expiry, round(snap.dte(expiry), 3), legs, round(credit, 2), wp, wc, round(max_loss, 2),
                      round(be_lo, 2), round(be_hi, 2), round(pop, 3), round(min(1.0, 2 * p_out), 3),
                      round(g("delta"), 4), round(g("gamma"), 6), round(g("theta"), 3), round(g("vega"), 3),
-                     round(credit / width, 3) if width else 0.0, notes or [])
+                     round(credit / width, 3) if width else 0.0, notes or [], round(credit + cfg.slippage_per_leg * 4, 2))
+
+
+def expected_close_cost(legs, spot: float, entry_ivs: list[float], T_years: float, cfg: Config) -> float:
+    """Mid cost to close if spot and IV never move and only time passes."""
+    return sum(-l["qty"] * ind.bs_price(spot, l["strike"], T_years, cfg.rate, cfg.div_yield, iv / 100, l["cp"])
+               for l, iv in zip(legs, entry_ivs))
+
+
+def decay_curve(s: Structure, spot: float, cfg: Config, step: float | None = None) -> list[tuple[float, float]]:
+    """(days_from_now, expected pnl as fraction of gross credit) with spot and IV frozen.
+    This is the theta schedule the trade is supposed to follow."""
+    legs = [{"cp": l.cp, "strike": l.strike, "qty": l.qty} for l in s.legs]
+    ivs = [l.iv for l in s.legs]
+    step = step or max(s.dte / 96, 0.002)   # 96 points on the curve; 0DTE resolves to ~3 minutes
+    out, d = [], 0.0
+    while d <= s.dte + 1e-9:
+        cost = expected_close_cost(legs, spot, ivs, (s.dte - d) / 365, cfg)
+        out.append((round(d, 3), (s.gross_credit - cost) / s.gross_credit))
+        d += step
+    return out
+
+
+def annotate_timing(s: Structure, spot: float, cfg: Config, profile: DTEProfile) -> None:
+    target = profile.fly_profit_target if s.kind == "IRON_FLY" else profile.condor_profit_target
+    curve = decay_curve(s, spot, cfg)
+    s.half_life_days = next((d for d, f in curve if f >= 0.5), None)
+    s.days_to_target = next((d for d, f in curve if f >= target), None)
+    if profile.target_dte == 0:
+        hh, mm = map(int, profile.exit_time.split(":"))
+        s.planned_hold_days = round(max(s.dte - (16 * 60 - hh * 60 - mm) / 1440, 0), 3)
+    else:
+        s.planned_hold_days = round(max(s.dte - profile.exit_dte, 0), 3)
+    if s.days_to_target is None or s.days_to_target > s.planned_hold_days:
+        s.notes.append(f"target {target:.0%} not expected inside the planned hold ({s.planned_hold_days:.1f}d): "
+                       f"needs {s.days_to_target or s.dte:.1f}d with spot frozen. Premium too thin for this DTE.")
 
 
 def build_condor(snap: Snapshot, expiry: date, cfg: Config, profile: DTEProfile,
@@ -98,6 +137,7 @@ def build_condor(snap: Snapshot, expiry: date, cfg: Config, profile: DTEProfile,
     if not (lp and lc) or lp.strike >= sp.strike or lc.strike <= sc.strike:
         return None
     s = assemble("IRON_CONDOR", snap, expiry, sp, lp, sc, lc, cfg)
+    annotate_timing(s, snap.spot, cfg, profile)
     if s.credit_to_width < profile.min_credit_to_width_condor:
         s.notes.append(f"credit/width {s.credit_to_width:.2f} < min {profile.min_credit_to_width_condor}: premium too thin")
     return s
@@ -134,6 +174,7 @@ def build_fly(snap: Snapshot, expiry: date, cfg: Config, profile: DTEProfile,
     if not (sc and lp and lc) or sc.strike != sp.strike or lp.strike >= sp.strike or lc.strike <= sc.strike:
         return None
     s = assemble("IRON_FLY", snap, expiry, sp, lp, sc, lc, cfg, notes)
+    annotate_timing(s, snap.spot, cfg, profile)
     if s.credit_to_width < profile.min_credit_to_width_fly:
         s.notes.append(f"credit/width {s.credit_to_width:.2f} < min {profile.min_credit_to_width_fly}: premium too thin")
     return s

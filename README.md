@@ -78,9 +78,41 @@ spot when one exists (pin magnet), otherwise ATM.
 - Total open max-loss ≤ 8 % of account; ≤ 4 positions; |portfolio delta| ≤ 40 per $100k.
 - Kill switch: VIX +20 % on the day or daily loss ≥ 3 % → no entries, defend what is open.
 
-## 5. Management playbook (`ironfly/manage.py`)
+## 5. Holding period: the trade's own half-life
 
-Evaluated every run for every position, in this order (first hit wins for the hard exits):
+There is no universal "hold for N days". Each structure gets a **decay curve** at entry: reprice
+the four legs with spot and IV frozen and only time passing (`structure.decay_curve`). From it:
+
+| Number | Meaning | Typical (synthetic, 16Δ condor) |
+|---|---|---|
+| `half_life_days` | when the premium is expected to have halved | 0DTE ≈ 3 h · weekly ≈ 3.5 d · 45-DTE ≈ 22 d |
+| `days_to_target` | when the profile's profit target should be hit | same as half-life for a 50 % target; earlier for the fly's 25 % |
+| `planned_hold_days` | entry → mechanical time exit (15:30 for 0DTE, 1 DTE weekly, 21 DTE monthly) | 0.2 d · 6 d · 24 d |
+
+The 45-DTE half-life landing at ~22 days is why "manage at 21 DTE" works: past that point most of
+the remaining credit is gamma risk, not theta. If `days_to_target` falls outside `planned_hold_days`
+the structure is flagged at scan time ("premium too thin for this DTE") and is not an entry.
+
+While the position is open, `Position.schedule()` recomputes where the trade *should* be on that
+curve today and `manage` compares it with actual P&L:
+
+| Rule | Trigger | Action |
+|---|---|---|
+| Ahead of schedule | ≥ 75 % of target captured within 40 % of `days_to_target` | TAKE_PROFIT now — the remaining edge is small relative to the gamma you keep holding |
+| Stale | held ≥ 1.5 × `days_to_target` and target not reached | STALE_EXIT — theta is not paying; capital is better redeployed into a fresh structure |
+| Lagging | past half the planned hold and P&L < 50 % of the expected curve | LAGGING flag — spot or IV moved against you; never add, take the first exit that triggers |
+
+Positions entered by hand can still use these rules if `positions.json` carries each leg's entry
+`iv` and `price` plus `entry_spot`; `paper-open` records them automatically.
+
+**So, in order, a trade's life is:** enter → let theta run to the target (~half-life) → if it gets
+there early, take it → if it stalls past 1.5× the expected time, leave → never hold past the time
+exit regardless of P&L → and at any point a tested strike triggers the adjustment ladder in §6.
+
+## 6. Management playbook (`ironfly/manage.py`)
+
+Evaluated every run for every position, in this order (first hit wins for the hard exits).
+The schedule rules from §5 run between the hard exits (1–3) and the environment rules (4).
 
 1. **TAKE_PROFIT** at the profile target. Flies are closed at 25 % of credit; they almost never
    reach max profit and the last 75 % is where the gamma lives.
@@ -103,7 +135,7 @@ Evaluated every run for every position, in this order (first hit wins for the ha
 Rules that never bend: roll only for a credit, never roll into an event window, never roll into
 backwardation, never add contracts to a losing position.
 
-## 6. Structure maths (`ironfly/structure.py`, `ironfly/indicators.py`)
+## 7. Structure maths (`ironfly/structure.py`, `ironfly/indicators.py`)
 
 Black-Scholes European with continuous dividend (SPX is cash-settled European; r = 4 %, q = 1.3 %,
 both in config). Broker greeks are used when supplied; otherwise IV is solved from mid and greeks
@@ -112,7 +144,7 @@ probability of finishing between breakevens at the shorts' average IV; P(touch) 
 P(finish beyond a short). Expiry time is 16:00 ET (PM-settled weeklies; the AM-settled monthly is
 6.5 h earlier, immaterial above 1 DTE).
 
-## 7. Files
+## 8. Files
 
 ```
 ironfly/config.py      thresholds, DTE profiles, JSON config
@@ -131,7 +163,7 @@ tests/test_core.py     self-check
 `positions.json` is a plain list you (or `paper-open`) maintain; the engine never assumes a fill.
 Every scan and every management decision is appended to `signals.jsonl` for later review.
 
-## 8. What to add when you have the data
+## 9. What to add when you have the data
 
 - **GEX / dealer gamma** (needs full OI by strike): positive GEX supports the fly, negative argues
   for wider condors or nothing. Hook: `structure.magnet_strike` is the natural home.

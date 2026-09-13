@@ -8,7 +8,7 @@ from .config import Config, DTEProfile
 from .events import blocking_events
 from .feeds import Snapshot
 from .regime import Regime, by_delta, pick_expiry
-from .structure import Structure, build_condor, build_fly, reprice, _nearest, assemble
+from .structure import Structure, build_condor, build_fly, reprice, _nearest, assemble, expected_close_cost
 
 # urgency: NOW = act this bar, ACT = act today, INFO = watch
 @dataclass
@@ -27,7 +27,7 @@ class Position:
     id: str
     kind: str
     expiry: str                 # ISO
-    legs: list[dict]            # {cp, strike, qty}
+    legs: list[dict]            # {cp, strike, qty, iv, price}  (iv/price at entry; optional for hand-entered positions)
     entry_credit: float         # points per unit
     contracts: int
     entry_ts: str
@@ -35,11 +35,28 @@ class Position:
     adjustments: int = 0
     stop_mult_override: float | None = None
     notes: list[str] = field(default_factory=list)
+    entry_spot: float | None = None
+    half_life_days: float | None = None
+    days_to_target: float | None = None
+    planned_hold_days: float | None = None
 
     @classmethod
-    def from_structure(cls, pid: str, s: Structure, contracts: int, ts: datetime, profile: str) -> "Position":
-        return cls(pid, s.kind, s.expiry.isoformat(), [{"cp": l.cp, "strike": l.strike, "qty": l.qty} for l in s.legs],
-                   s.credit, contracts, ts.isoformat(), profile)
+    def from_structure(cls, pid: str, s: Structure, contracts: int, ts: datetime, profile: str, spot: float | None = None) -> "Position":
+        return cls(pid, s.kind, s.expiry.isoformat(),
+                   [{"cp": l.cp, "strike": l.strike, "qty": l.qty, "iv": l.iv, "price": l.price} for l in s.legs],
+                   s.credit, contracts, ts.isoformat(), profile, entry_spot=spot,
+                   half_life_days=s.half_life_days, days_to_target=s.days_to_target, planned_hold_days=s.planned_hold_days)
+
+    def schedule(self, now: datetime, dte_now: float, cfg: Config) -> dict | None:
+        """Where the trade should be on its own theta curve right now. None if entry ivs unknown."""
+        if self.entry_spot is None or any("iv" not in l or "price" not in l for l in self.legs):
+            return None
+        days_held = (now - datetime.fromisoformat(self.entry_ts)).total_seconds() / 86400
+        gross = sum(-l["qty"] * l["price"] for l in self.legs)
+        cost = expected_close_cost(self.legs, self.entry_spot, [l["iv"] for l in self.legs], dte_now / 365, cfg)
+        return {"days_held": round(days_held, 2), "expected_pnl_frac": round((gross - cost) / gross, 3),
+                "half_life_days": self.half_life_days, "days_to_target": self.days_to_target,
+                "planned_hold_days": self.planned_hold_days}
 
     def to_dict(self):
         return asdict(self)
@@ -116,7 +133,23 @@ def evaluate(pos: Position, snap: Snapshot, regime: Regime, cfg: Config, profile
     if breached and regime.adx >= cfg.breach_adx:
         return [Action("STOP_LOSS", "NOW", f"short strike breached with ADX {regime.adx:.0f} >= {cfg.breach_adx}: trending, do not fight", m)]
 
-    # 2. environment-driven
+    # 2. schedule: is theta paying on time?
+    sch = pos.schedule(snap.ts, dte, cfg)
+    if sch:
+        m.update(sch)
+        m["vs_schedule"] = round(pnl_frac - sch["expected_pnl_frac"], 3)
+        held, d2t, plan = sch["days_held"], sch["days_to_target"], sch["planned_hold_days"]
+        if d2t and pnl_frac >= profile.early_take_frac * target and held <= profile.early_time_frac * d2t:
+            return [Action("TAKE_PROFIT", "NOW", f"ahead of schedule: {pnl_frac:.0%} captured in {held:.1f}d, "
+                           f"expected {d2t:.1f}d for {target:.0%}. Take it; remaining edge is tiny vs gamma", m)]
+        if d2t and held >= profile.stale_mult * d2t and pnl_frac < target:
+            return [Action("STALE_EXIT", "ACT", f"held {held:.1f}d, {profile.stale_mult}x the expected {d2t:.1f}d to target, "
+                           f"still only {pnl_frac:+.0%}: theta is not paying, redeploy capital", m)]
+        if plan and held >= 0.5 * plan and pnl_frac < profile.lag_tolerance * sch["expected_pnl_frac"]:
+            acts.append(Action("LAGGING", "INFO", f"{pnl_frac:+.0%} vs {sch['expected_pnl_frac']:+.0%} expected at day {held:.1f}: "
+                               "spot or IV moved against the trade; do not add, lean toward the first exit that triggers", m))
+
+    # 3. environment-driven
     if regime.hostile():
         if pnl_pts > 0:
             return [Action("REGIME_EXIT", "NOW", f"regime hostile {regime.vetoes}; book the gain", m)]
@@ -126,7 +159,7 @@ def evaluate(pos: Position, snap: Snapshot, regime: Regime, cfg: Config, profile
     if ev and dte <= 2 and profile.target_dte > 0:
         acts.append(Action("EVENT_EXIT", "ACT", f"{ev[0]['name']} on {ev[0]['date']} inside the last 2 DTE; close or halve", m))
 
-    # 3. tested side -> adjust / roll / exit
+    # 4. tested side -> adjust / roll / exit
     if tested_cp:
         can_adjust = pos.adjustments < profile.max_adjustments and dte > profile.roll_min_dte
         un = sc if tested_cp == "P" else sp

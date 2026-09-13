@@ -49,6 +49,8 @@ def print_scan(r):
         print(f"credit {s.credit:.2f}  width {s.width_put:.0f}/{s.width_call:.0f}  credit/width {s.credit_to_width:.2f}  "
               f"max loss {s.max_loss:.2f} (${s.max_loss*100:,.0f}/ct)  BE {s.be_lo:.0f}-{s.be_hi:.0f}  POP {s.pop:.0%}  P(touch) {s.p_touch_short:.0%}")
         print(f"greeks/ct: delta {s.delta*100:+.1f} gamma {s.gamma*100:.4f} theta {s.theta*100:+.1f}/day vega {s.vega*100:+.1f}")
+        print(f"timing: half-life {s.half_life_days}d  expected days to target {s.days_to_target}d  planned hold {s.planned_hold_days}d"
+              f"  (stale after {s.days_to_target * PROFILES[r.profile].stale_mult if s.days_to_target else '-'}d)")
         print(f"size: {r.contracts} contracts   ({'; '.join(r.sizing_notes)})")
         for n in s.notes: print("note:", n)
     print("\n>>> ENTRY SIGNAL" if r.entry_signal() else "\n>>> NO ENTRY")
@@ -77,7 +79,7 @@ def main(argv=None):
         r = eng.scan(positions, a.daily_pnl)
         print(json.dumps(r.to_dict(), indent=1, default=str)) if a.json else print_scan(r)
         if a.cmd == "demo" and r.structure:
-            pos = Position.from_structure("demo-1", r.structure, max(r.contracts, 1), eng.snapshot().ts, a.profile)
+            pos = Position.from_structure("demo-1", r.structure, max(r.contracts, 1), eng.snapshot().ts, a.profile, eng.snapshot().spot)
             positions = [pos]
             print("\n-- managing the position just built (same snapshot, so expect HOLD) --")
     if a.cmd == "paper-open":
@@ -85,7 +87,7 @@ def main(argv=None):
         if not r.entry_signal():
             print_scan(r); raise SystemExit("no entry signal; nothing opened")
         pid = f"{a.profile}-{datetime.now():%Y%m%d-%H%M}"
-        positions.append(Position.from_structure(pid, r.structure, r.contracts, eng.snapshot().ts, a.profile))
+        positions.append(Position.from_structure(pid, r.structure, r.contracts, eng.snapshot().ts, a.profile, eng.snapshot().spot))
         Path(a.positions).write_text(json.dumps([p.to_dict() for p in positions], indent=1))
         print(f"recorded paper position {pid} in {a.positions}"); return
     if a.cmd in ("manage", "demo"):
