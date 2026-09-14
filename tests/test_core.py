@@ -45,6 +45,16 @@ def test_fomc_blocks_entry():
     assert any(v.startswith("EVENT_FOMC") for v in eng.scan().regime.vetoes)
 
 
+def test_cpi_nfp_pce_block_entry():
+    # weekly profile blocks 2 days ahead of an event; CPI/NFP/PCE prints are all seeded for 2026
+    for d, tag in [(datetime(2026, 9, 9, 10, 15, tzinfo=ET), "CPI"),      # CPI Sep 11
+                   (datetime(2026, 9, 2, 10, 15, tzinfo=ET), "NFP"),      # NFP Sep 4
+                   (datetime(2026, 9, 28, 10, 15, tzinfo=ET), "PCE")]:    # PCE Sep 30
+        eng = Engine(SyntheticFeed(regime="calm", ts=d), Config(), "weekly", journal=None)
+        vetoes = eng.scan().regime.vetoes
+        assert any(v.startswith(f"EVENT_{tag}") for v in vetoes), (tag, vetoes)
+
+
 def test_management_triggers():
     cfg, prof = Config(), PROFILES["weekly"]
     ts = datetime(2026, 9, 21, 10, 15, tzinfo=ET)

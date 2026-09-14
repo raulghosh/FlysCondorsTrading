@@ -150,7 +150,7 @@ P(finish beyond a short). Expiry time is 16:00 ET (PM-settled weeklies; the AM-s
 ironfly/config.py      thresholds, DTE profiles, JSON config
 ironfly/feeds.py       Snapshot/OptionQuote; CSV, Schwab, Alpaca, Synthetic feeds; CBOE index history
 ironfly/indicators.py  BSM, IV solver, realized vol (CC, Yang-Zhang), IV rank, ADX/ATR, expected move
-ironfly/events.py      FOMC 2026 seed + data/events.json + computed opex/quad-witching/NFP
+ironfly/events.py      FOMC/CPI/NFP/PCE 2026 seed + data/events.json + computed opex/quad-witching
 ironfly/regime.py      classify() -> Regime(strategy, scores, vetoes, warnings)
 ironfly/structure.py   build_condor / build_fly / reprice / OI magnet
 ironfly/manage.py      evaluate(position) -> [Action]
@@ -169,4 +169,9 @@ Every scan and every management decision is appended to `signals.jsonl` for late
   for wider condors or nothing. Hook: `structure.magnet_strike` is the natural home.
 - **Intraday 0DTE features**: opening-range width vs expected move, VWAP distance, 1-minute realized vol.
 - **A backtester** over stored snapshots: the `CSVFeed` + `ts` argument already allow replay.
-- **CPI/NFP/PCE exact dates**: put them in `data/events.json` (`[{"date":"2026-10-14","name":"CPI"}]`).
+- **Event calendar upkeep**: FOMC, CPI, the jobs report, and PCE are seeded for all of 2026 in
+  `ironfly/events.py` from the Fed/BLS/BEA official calendars. Re-pull and update `FOMC_2026` /
+  `CPI_2026` / `NFP_2026` / `PCE_2026` each year (roughly Q4, once the next year's calendars are
+  published) or as revisions land. Anything else — an unseeded print, an earnings date, a
+  geopolitical event — goes in `data/events.json` (`[{"date":"2026-10-14","name":"CPI"}]`), which
+  is merged on top of the seed.
