@@ -1,4 +1,4 @@
-"""CLI.  python -m ironfly demo | scan | manage | paper-open | show-config"""
+"""CLI.  python -m ironfly demo | scan | manage | paper-open | record | backtest | show-config"""
 from __future__ import annotations
 import argparse, json, sys
 from datetime import datetime
@@ -6,8 +6,9 @@ from pathlib import Path
 
 from .config import Config, PROFILES
 from .engine import Engine
-from .feeds import CSVFeed, SchwabFeed, AlpacaFeed, SyntheticFeed
+from .feeds import CSVFeed, SchwabFeed, AlpacaFeed, SyntheticFeed, SyntheticPath
 from .manage import Position
+from . import store, backtest
 
 
 def make_feed(a):
@@ -15,6 +16,8 @@ def make_feed(a):
         return SyntheticFeed(regime=a.regime)
     if a.feed == "csv":
         return CSVFeed(a.data)
+    if a.feed == "replay":
+        return store.ReplayFeed(a.snapshots)
     if a.feed == "schwab":
         return SchwabFeed()
     if a.feed == "alpaca":
@@ -58,8 +61,10 @@ def print_scan(r):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ironfly")
-    ap.add_argument("cmd", choices=["demo", "scan", "manage", "paper-open", "show-config"])
-    ap.add_argument("--feed", default="synthetic", choices=["synthetic", "csv", "schwab", "alpaca"])
+    ap.add_argument("cmd", choices=["demo", "scan", "manage", "paper-open", "record", "backtest", "show-config"])
+    ap.add_argument("--feed", default="synthetic", choices=["synthetic", "csv", "schwab", "alpaca", "replay"])
+    ap.add_argument("--snapshots", default="data/snapshots", help="folder for record / replay / backtest")
+    ap.add_argument("--days", type=int, default=120, help="synthetic backtest length")
     ap.add_argument("--regime", default="calm", choices=["calm", "stress"], help="synthetic feed only")
     ap.add_argument("--data", default="data", help="folder for csv feed")
     ap.add_argument("--profile", default="weekly", choices=list(PROFILES))
@@ -72,7 +77,16 @@ def main(argv=None):
     if a.cmd == "show-config":
         print(Config().to_json()); return
     cfg = load_cfg(a.config)
+    if a.cmd == "backtest":
+        snaps = SyntheticPath(days=a.days) if a.feed == "synthetic" else store.ReplayFeed(a.snapshots)
+        rep = backtest.run(snaps, cfg, a.profile)
+        backtest.print_report(rep)
+        rep.to_csv("backtest_trades.csv"); print("trades -> backtest_trades.csv")
+        if a.json: print(json.dumps(rep.summary(), indent=1))
+        return
     eng = Engine(make_feed(a), cfg, a.profile)
+    if a.cmd == "record":
+        print("saved", store.save(eng.snapshot(), a.snapshots)); return
     positions = load_positions(a.positions)
 
     if a.cmd in ("scan", "demo"):

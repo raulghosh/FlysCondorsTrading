@@ -35,7 +35,7 @@ class ScanResult:
 
 
 class Engine:
-    def __init__(self, feed: MarketFeed, cfg: Config | None = None, profile: str = "weekly", journal: str | None = "signals.jsonl"):
+    def __init__(self, feed: MarketFeed | None, cfg: Config | None = None, profile: str = "weekly", journal: str | None = "signals.jsonl"):
         self.feed, self.cfg, self.profile = feed, cfg or Config(), PROFILES[profile]
         self.events = load_events(self.cfg.events_file)
         self.journal = Path(journal) if journal else None
@@ -43,8 +43,14 @@ class Engine:
 
     def snapshot(self, refresh=False) -> Snapshot:
         if self._snap is None or refresh:
+            if self.feed is None:
+                raise RuntimeError("no feed; call set_snapshot()")
             self._snap = self.feed.snapshot()
         return self._snap
+
+    def set_snapshot(self, snap: Snapshot) -> None:
+        """Drive the engine from an external snapshot (replay / backtest)."""
+        self._snap = snap
 
     def scan(self, positions: list[Position] | None = None, daily_pnl_usd: float = 0.0) -> ScanResult:
         snap = self.snapshot()

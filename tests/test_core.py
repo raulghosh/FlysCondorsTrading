@@ -109,6 +109,33 @@ def test_schedule_rules():
     assert a.type == "TAKE_PROFIT" and "ahead of schedule" in a.reason, a
 
 
+def test_store_roundtrip(tmp_path=None):
+    import tempfile
+    from ironfly import store
+    snap = SyntheticFeed(regime="calm", ts=datetime(2026, 9, 21, 10, 15, tzinfo=ET)).snapshot()
+    with tempfile.TemporaryDirectory() as d:
+        p = store.save(snap, d)
+        back = store.load(p)
+    assert back.ts == snap.ts and back.spot == snap.spot and len(back.chain) == len(snap.chain)
+    assert back.history.shape == snap.history.shape and abs(back.history["close"].iloc[-1] - snap.history["close"].iloc[-1]) < 1e-4
+    assert back.chain[0].expiry == snap.chain[0].expiry and abs(back.chain[0].delta - snap.chain[0].delta) < 1e-4
+
+
+def test_backtest_accounting():
+    from ironfly import backtest
+    from ironfly.feeds import SyntheticPath
+    rep = backtest.run(SyntheticPath(days=90, end=datetime(2026, 9, 11).date()), Config(), "weekly")
+    s = rep.summary()
+    assert s["trades"] > 0, s
+    for t in rep.trades:
+        assert abs(t.pnl_usd - (t.entry_credit - t.exit_cost) * 100 * t.contracts) < 1.0
+        assert t.exit_reason in backtest.CLOSE | {"ROLL_OUT_IN_TIME", "RECENTER_FLY", "EXPIRED"}
+        assert t.days_held >= 0
+    assert s["total_pnl"] == round(sum(t.pnl_usd for t in rep.trades))
+    assert sum(v["n"] for v in s["by_exit"].values()) == s["trades"]
+    assert rep.scans == rep.entries_signalled + sum(rep.blocked.values())
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

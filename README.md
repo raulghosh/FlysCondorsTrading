@@ -10,6 +10,8 @@ python -m ironfly scan --profile weekly      # entry scan (synthetic by default)
 python -m ironfly scan --feed schwab --profile monthly
 python -m ironfly paper-open --feed schwab   # record last entry signal into positions.json
 python -m ironfly manage --feed schwab       # actions for every position in positions.json
+python -m ironfly record --feed schwab       # save one snapshot to data/snapshots/ (cron it every 15 min)
+python -m ironfly backtest --days 250        # synthetic path; --feed replay --snapshots data/snapshots for real
 python -m ironfly show-config > config.json  # then edit; every threshold lives there
 python tests/test_core.py
 ```
@@ -156,6 +158,8 @@ ironfly/structure.py   build_condor / build_fly / reprice / OI magnet
 ironfly/manage.py      evaluate(position) -> [Action]
 ironfly/risk.py        size() and kill_switch()
 ironfly/engine.py      Engine.scan() / Engine.manage(); appends to signals.jsonl
+ironfly/store.py       save/load snapshots as JSON; ReplayFeed
+ironfly/backtest.py    replay snapshots, act on signals, tally P&L by exit reason
 ironfly/__main__.py    CLI
 tests/test_core.py     self-check
 ```
@@ -163,12 +167,32 @@ tests/test_core.py     self-check
 `positions.json` is a plain list you (or `paper-open`) maintain; the engine never assumes a fill.
 Every scan and every management decision is appended to `signals.jsonl` for later review.
 
-## 9. What to add when you have the data
+## 9. Recording and backtesting (`ironfly/store.py`, `ironfly/backtest.py`)
+
+Brokers only serve live chains, so the history you can backtest on is the history you record.
+`record` writes one JSON snapshot (~300 KB: chain, VIX family, 2y daily history) to
+`data/snapshots/`; run it from cron every 15 minutes during RTH from day one. `backtest` replays
+snapshots through the same `scan`/`manage` code that runs live and acts on the signals mechanically:
+
+- one entry per day, one position per expiry, fills at mid less slippage;
+- exits close at the reported close cost; `ROLL_UNTESTED_IN` mutates the position and adds the
+  credit; `ROLL_OUT_IN_TIME` / `RECENTER_FLY` close one trade and open a linked one;
+- anything still open past expiry settles at intrinsic (only happens with sparse snapshots).
+
+The report gives win rate, average win/loss, max drawdown on closed trades, average days held
+against the average expected days-to-target, P&L by exit reason (this is what tells you whether
+the stale rule or the untested roll actually earns its keep), and a tally of why scans did *not*
+become entries. `backtest_trades.csv` has every trade.
+
+`--feed synthetic` runs a simulated path with real Friday expiries so the machinery can be
+exercised without data; the numbers it prints say nothing about SPX. Calibrate thresholds only on
+recorded snapshots, and only after you have several months of them.
+
+## 10. What to add when you have the data
 
 - **GEX / dealer gamma** (needs full OI by strike): positive GEX supports the fly, negative argues
   for wider condors or nothing. Hook: `structure.magnet_strike` is the natural home.
 - **Intraday 0DTE features**: opening-range width vs expected move, VWAP distance, 1-minute realized vol.
-- **A backtester** over stored snapshots: the `CSVFeed` + `ts` argument already allow replay.
 - **Event calendar upkeep**: FOMC, CPI, the jobs report, and PCE are seeded for all of 2026 in
   `ironfly/events.py` from the Fed/BLS/BEA official calendars. Re-pull and update `FOMC_2026` /
   `CPI_2026` / `NFP_2026` / `PCE_2026` each year (roughly Q4, once the next year's calendars are

@@ -1,1 +1,6 @@
 .serena/
+data/snapshots/
+signals.jsonl
+backtest_trades.csv
+positions.json
+__pycache__/

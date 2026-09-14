@@ -263,10 +263,54 @@ class AlpacaFeed:
                 return out
 
 
-# ---------------- Synthetic (demo / tests) ----------------
+# ---------------- Synthetic (demo / tests / backtest) ----------------
+
+def _gbm_history(rng, n: int, end: date, spot_end: float, regime: str = "calm") -> pd.DataFrame:
+    """GBM with vol clustering; VIX = RV20 x 1.25 + noise (positive VRP); contango unless stress."""
+    vol = np.empty(n); vol[0] = 0.14
+    rets = np.empty(n)
+    for i in range(n):
+        if i:
+            vol[i] = 0.93 * vol[i - 1] + 0.07 * 0.14 + 0.02 * rng.standard_normal() * (1 + 3 * (rets[i - 1] < -0.01))
+            vol[i] = float(np.clip(vol[i], 0.08, 0.6))
+        rets[i] = rng.standard_normal() * vol[i] / math.sqrt(252) + 0.0003
+    close = np.exp(np.cumsum(rets))
+    close = close / close[-1] * spot_end
+    opn = close * np.exp(rng.standard_normal(n) * vol / math.sqrt(252) * 0.3)
+    high = np.maximum(opn, close) * (1 + np.abs(rng.standard_normal(n)) * vol / math.sqrt(252) * 0.5)
+    low = np.minimum(opn, close) * (1 - np.abs(rng.standard_normal(n)) * vol / math.sqrt(252) * 0.5)
+    rv = pd.Series(np.log(close)).diff().rolling(20).std().bfill().values * math.sqrt(252) * 100
+    vix = rv * 1.25 + rng.standard_normal(n) * 0.8 + 1.0
+    if regime == "stress":
+        vix = vix * 1.8; ts_ratio, vvix = 1.08, 140.0
+    else:
+        ts_ratio, vvix = 0.92, 92.0
+    idx = pd.bdate_range(end=end, periods=n + 5)[-n:]
+    return pd.DataFrame({"open": opn, "high": high, "low": low, "close": close, "vix": vix, "vix3m": vix / ts_ratio,
+                         "vvix": vvix, "vix9d": vix * (1.05 if regime == "stress" else 0.95)}, index=idx)
+
+
+def _bsm_chain(rng, spot: float, atm_iv: float, ts: datetime, expiries: list[date], r: float, q: float) -> list[OptionQuote]:
+    """Strikes every 5 pts, 85-115% of spot; put skew + call smile; OI heavier on round strikes."""
+    chain = []
+    for exp in expiries:
+        d = (exp - ts.date()).days
+        T = max((datetime.combine(exp, SETTLE_TIME, tzinfo=ET) - ts).total_seconds(), 60) / (365 * 86400)
+        for k in np.arange(round(spot * 0.85 / 5) * 5, spot * 1.15, 5.0):
+            m = (spot - k) / spot
+            iv = atm_iv * (1 + 2.2 * m) if m >= 0 else atm_iv * (1 - 0.6 * m + 4 * m * m)
+            iv *= (1 + 0.15 * (d == 0))
+            for cp in "PC":
+                px = ind.bs_price(spot, k, T, r, q, iv / 100, cp)
+                half = max(0.05, 0.02 * px + 0.1 * (d == 0))
+                oi = int(rng.integers(50, 3000)) * (8 if k % 50 == 0 else 1)
+                chain.append(OptionQuote(exp, float(k), cp, max(px - half, 0.0), px + half, iv, 0.0, oi=oi))
+    fill_greeks(chain, ts, spot, r, q)
+    return chain
+
 
 class SyntheticFeed:
-    """GBM with vol clustering, contango VIX, BSM chain with put skew. Deterministic by seed."""
+    """One snapshot: GBM history, contango VIX, BSM chain with put skew. Deterministic by seed."""
 
     def __init__(self, seed=7, days=420, spot0=6400.0, atm_iv=18.0, regime="calm", ts: datetime | None = None,
                  dtes=(0, 1, 2, 7, 14, 30, 45), r=0.04, q=0.013):
@@ -275,45 +319,45 @@ class SyntheticFeed:
 
     def snapshot(self) -> Snapshot:
         rng = np.random.default_rng(self.seed)
-        n = self.days
-        vol = np.empty(n); vol[0] = 0.14
-        rets = np.empty(n)
-        for i in range(n):
-            if i:
-                vol[i] = 0.93 * vol[i - 1] + 0.07 * 0.14 + 0.02 * rng.standard_normal() * (1 + 3 * (rets[i - 1] < -0.01))
-                vol[i] = float(np.clip(vol[i], 0.08, 0.6))
-            rets[i] = rng.standard_normal() * vol[i] / math.sqrt(252) + 0.0003
-        close = self.spot0 * np.exp(np.cumsum(rets)) / math.exp(rets.sum()) * 1.0
-        close = close / close[-1] * self.spot0
-        opn = close * np.exp(rng.standard_normal(n) * vol / math.sqrt(252) * 0.3)
-        high = np.maximum(opn, close) * (1 + np.abs(rng.standard_normal(n)) * vol / math.sqrt(252) * 0.5)
-        low = np.minimum(opn, close) * (1 - np.abs(rng.standard_normal(n)) * vol / math.sqrt(252) * 0.5)
-        rv = pd.Series(np.log(close)).diff().rolling(20).std().bfill().values * math.sqrt(252) * 100
-        vix = rv * 1.25 + rng.standard_normal(n) * 0.8 + 1.0
-        vix[-15:] += np.linspace(0, self.atm_iv - vix[-1], 15)   # recent vol pickup so IVR is mid-range
-        if self.regime == "stress":
-            vix = vix * 1.8; ts_ratio, vvix = 1.08, 140.0
-        else:
-            ts_ratio, vvix = 0.92, 92.0
         ts = self.ts or datetime.combine(date.today(), time(10, 15), tzinfo=ET)
-        idx = pd.bdate_range(end=ts.date(), periods=n + 5)[-n:]
-        hist = pd.DataFrame({"open": opn, "high": high, "low": low, "close": close, "vix": vix,
-                             "vix3m": vix / ts_ratio, "vvix": vvix, "vix9d": vix * (1.05 if self.regime == "stress" else 0.95)}, index=idx)
-        spot = float(close[-1])
+        hist = _gbm_history(rng, self.days, ts.date(), self.spot0, self.regime)
+        vix = hist["vix"].to_numpy().copy()
+        vix[-15:] += np.linspace(0, self.atm_iv - vix[-1], 15)   # recent vol pickup so IVR is mid-range
+        hist["vix"] = vix; hist["vix3m"] = vix / (1.08 if self.regime == "stress" else 0.92)
+        hist["vix9d"] = vix * (1.05 if self.regime == "stress" else 0.95)
+        spot = float(hist["close"].iloc[-1])
         atm = float(vix[-1]) if self.regime == "stress" else self.atm_iv
-        chain = []
-        for d in self.dtes:
-            exp = ts.date() + timedelta(days=d)
-            T = max((datetime.combine(exp, SETTLE_TIME, tzinfo=ET) - ts).total_seconds(), 60) / (365 * 86400)
-            for k in np.arange(round(spot * 0.85 / 5) * 5, spot * 1.15, 5.0):
-                m = (spot - k) / spot
-                iv = atm * (1 + 2.2 * m) if m >= 0 else atm * (1 - 0.6 * m + 4 * m * m)
-                iv *= (1 + 0.15 * (d == 0))
-                for cp in "PC":
-                    px = ind.bs_price(spot, k, T, self.r, self.q, iv / 100, cp)
-                    half = max(0.05, 0.02 * px + 0.1 * (d == 0))
-                    oi = int(rng.integers(50, 3000)) * (8 if k % 50 == 0 else 1)
-                    chain.append(OptionQuote(exp, float(k), cp, max(px - half, 0.0), px + half, iv, 0.0, oi=oi))
-        fill_greeks(chain, ts, spot, self.r, self.q)
-        return Snapshot(ts, spot, float(vix[-1]), float(vix[-2]), chain, hist, float(vix[-1] / ts_ratio), vvix,
-                        float(hist["vix9d"].iloc[-1]), source=f"synthetic:{self.regime}")
+        chain = _bsm_chain(rng, spot, atm, ts, [ts.date() + timedelta(days=d) for d in self.dtes], self.r, self.q)
+        return Snapshot(ts, spot, float(vix[-1]), float(vix[-2]), chain, hist, float(hist["vix3m"].iloc[-1]),
+                        float(hist["vvix"].iloc[-1]), float(hist["vix9d"].iloc[-1]), source=f"synthetic:{self.regime}")
+
+
+class SyntheticPath:
+    """Iterable of one 10:15 ET snapshot per business day along a single simulated path, with real
+    Friday expiries so positions can be carried and managed across days. For backtest demos.
+    ponytail: indicators see the day's close at 10:15 (mild lookahead); irrelevant for a synthetic demo."""
+
+    def __init__(self, seed=7, warmup=420, days=120, spot0=6400.0, end: date | None = None, r=0.04, q=0.013):
+        self.seed, self.warmup, self.days, self.spot0, self.end, self.r, self.q = seed, warmup, days, spot0, end, r, q
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed)
+        n = self.warmup + self.days
+        hist = _gbm_history(rng, n, self.end or date.today(), self.spot0)
+        vix = hist["vix"].to_numpy().copy()
+        mean60 = pd.Series(vix).rolling(60).mean().bfill().values
+        stressed = vix > 1.4 * mean60                      # vol spike days: backwardation + VVIX up
+        hist["vix3m"] = np.where(stressed, vix / 1.05, vix / 0.92)
+        hist["vvix"] = np.where(stressed, 135.0, 92.0)
+        hist["vix9d"] = np.where(stressed, vix * 1.04, vix * 0.95)
+        for i in range(self.warmup, n):
+            day = hist.index[i].date()
+            ts = datetime.combine(day, time(10, 15), tzinfo=ET)
+            h = hist.iloc[: i + 1]
+            spot = float(h["close"].iloc[-1])
+            # SPX lists Mon/Wed/Fri weeklies ~5 weeks out, Fridays beyond that
+            exps = [day + timedelta(days=k) for k in range(0, 61)
+                    if (day + timedelta(days=k)).weekday() in ((0, 2, 4) if k <= 35 else (4,))]
+            chain = _bsm_chain(rng, spot, float(vix[i]), ts, exps, self.r, self.q)
+            yield Snapshot(ts, spot, float(vix[i]), float(vix[i - 1]), chain, h, float(h["vix3m"].iloc[-1]),
+                           float(h["vvix"].iloc[-1]), float(h["vix9d"].iloc[-1]), source="synthetic:path")
